@@ -9,101 +9,162 @@ app.use(express.json());
 const preguntas = [
   {
     pregunta: "¿Dónde registras un pago CDA?",
-    respuesta: "En el módulo de caja",
-    explicacion: "Todos los pagos se registran en caja."
+    respuesta: "módulo de caja"
   },
   {
-    pregunta: "Paciente llega sin cita pero ya pagó. ¿Qué haces?",
-    respuesta: "Verificar pago y asignar cita",
-    explicacion: "Siempre validar pago antes de atender."
+    pregunta: "Paciente sin cita pero ya pagó, ¿qué haces?",
+    respuesta: "verificar pago y asignar cita"
   },
   {
-    pregunta: "¿Dónde ves el saldo de un paciente?",
-    respuesta: "Estado de cuenta",
-    explicacion: "Ahí está historial completo."
+    pregunta: "¿Dónde ves el saldo del paciente?",
+    respuesta: "estado de cuenta"
   }
 ];
 
-const sesiones = {};
+let estadoJuego = {
+  equipos: [],
+  turnoIndex: 0,
+  activo: false,
+  preguntaIndex: 0
+};
 
-async function evaluar(p, r, u) {
-  const prompt = `
-Evalúa respuesta.
+let scores = {};
 
-Pregunta: ${p}
-Respuesta correcta: ${r}
-Respuesta usuario: ${u}
+function siguienteEquipo(){
+  estadoJuego.turnoIndex =
+    (estadoJuego.turnoIndex + 1) % estadoJuego.equipos.length;
+  return estadoJuego.equipos[estadoJuego.turnoIndex];
+}
 
-Responde JSON:
-{"resultado":"correcta|parcial|incorrecta","explicacion":"breve"}
+async function evaluarRespuesta(pregunta, correcta, usuario, estado) {
+
+const prompt = `
+Eres conductor de concurso estilo TV.
+
+Pregunta: ${pregunta}
+Respuesta correcta: ${correcta}
+Respuesta: ${usuario}
+Equipo: ${estado.turno}
+
+Evalúa y responde JSON:
+
+{
+ "resultado":"correcta|parcial|incorrecta",
+ "puntos":10,
+ "mensaje":"texto corto con emoción y suspenso",
+ "siguiente":"nombre equipo"
+}
 `;
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.AI_API_KEY}`,
-      "Content-Type": "application/json"
+const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${process.env.AI_API_KEY}`,
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: prompt }]
+  })
+});
+
+const data = await res.json();
+
+try{
+  return JSON.parse(data.choices[0].message.content);
+}catch{
+  return {resultado:"incorrecta", puntos:0, mensaje:"Error", siguiente:estado.equipos[0]};
+}
+}
+
+// CHAT
+app.post("/chat", async (req,res)=>{
+  const { mensaje } = req.body;
+  const txt = mensaje.toLowerCase();
+
+  // registrar equipo
+  if(txt.startsWith("registrar:")){
+    const nombre = mensaje.split(":")[1].trim();
+
+    if(!estadoJuego.equipos.includes(nombre)){
+      estadoJuego.equipos.push(nombre);
+      scores[nombre]=0;
+    }
+
+    return res.json({
+      respuesta:`Equipo ${nombre} registrado\nEquipos: ${estadoJuego.equipos.join(", ")}`
+    });
+  }
+
+  // iniciar
+  if(txt === "iniciar"){
+    estadoJuego.activo = true;
+    estadoJuego.turnoIndex = 0;
+    estadoJuego.preguntaIndex = 0;
+
+    return res.json({
+      respuesta:`🎮 Iniciamos\n\nTurno: ${estadoJuego.equipos[0]}\n\n${preguntas[0].pregunta}`
+    });
+  }
+
+  // evaluar
+  if(estadoJuego.activo){
+    const equipo = estadoJuego.equipos[estadoJuego.turnoIndex];
+    const actual = preguntas[estadoJuego.preguntaIndex];
+
+    const ev = await evaluarRespuesta(
+      actual.pregunta,
+      actual.respuesta,
+      mensaje,
+      {equipos:estadoJuego.equipos, turno:equipo}
+    );
+
+    scores[equipo]+=ev.puntos;
+
+    estadoJuego.preguntaIndex++;
+
+    if(estadoJuego.preguntaIndex >= preguntas.length){
+      estadoJuego.activo=false;
+
+      return res.json({
+        respuesta:`${ev.mensaje}\n\nFin del juego`
+      });
+    }
+
+    const next = siguienteEquipo();
+
+    return res.json({
+      respuesta:
+      `${ev.mensaje}\n\n`+
+      `🏆 ${equipo}: ${scores[equipo]} pts\n\n`+
+      `👉 Turno: ${next}\n\n${preguntas[estadoJuego.preguntaIndex].pregunta}`
+    });
+  }
+
+  res.json({respuesta:"Escribe registrar: Equipo o iniciar"});
+});
+
+// VOZ
+app.post("/voz", async (req,res)=>{
+  const { texto } = req.body;
+
+  const r = await fetch("https://api.openai.com/v1/audio/speech", {
+    method:"POST",
+    headers:{
+      "Authorization":`Bearer ${process.env.AI_API_KEY}`,
+      "Content-Type":"application/json"
     },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2
+    body:JSON.stringify({
+      model:"gpt-4o-mini-tts",
+      voice:"alloy",
+      input:texto
     })
   });
 
-  const data = await res.json();
-  try {
-    return JSON.parse(data.choices[0].message.content);
-  } catch {
-    return { resultado: "incorrecta", explicacion: "error evaluando" };
-  }
-}
+  const buffer = await r.arrayBuffer();
 
-app.post("/chat", async (req, res) => {
-  const { userId, mensaje } = req.body;
-
-  if (!sesiones[userId]) {
-    sesiones[userId] = { i: 0, pts: 0, activo: false };
-  }
-
-  const s = sesiones[userId];
-
-  if (mensaje.toLowerCase().includes("jugar")) {
-    s.i = 0;
-    s.pts = 0;
-    s.activo = true;
-
-    return res.json({
-      respuesta: `Va.\n\nPregunta 1:\n${preguntas[0].pregunta}`
-    });
-  }
-
-  if (!s.activo) {
-    return res.json({ respuesta: "Escribe 'jugar'" });
-  }
-
-  const actual = preguntas[s.i];
-  const ev = await evaluar(actual.pregunta, actual.respuesta, mensaje);
-
-  let puntos = 0;
-  if (ev.resultado === "correcta") puntos = 10;
-  if (ev.resultado === "parcial") puntos = 5;
-
-  s.pts += puntos;
-  s.i++;
-
-  if (s.i >= preguntas.length) {
-    s.activo = false;
-    return res.json({
-      respuesta: `${ev.resultado}\n${ev.explicacion}\n\nTotal: ${s.pts}\n\nFin.`
-    });
-  }
-
-  return res.json({
-    respuesta:
-      `${ev.resultado}\n${ev.explicacion}\n\nPuntos: ${s.pts}\n\n` +
-      `Pregunta ${s.i + 1}:\n${preguntas[s.i].pregunta}`
-  });
+  res.set({"Content-Type":"audio/mpeg"});
+  res.send(Buffer.from(buffer));
 });
 
-app.listen(3000, () => console.log("ok"));
+app.listen(3000, ()=>console.log("OK"));
